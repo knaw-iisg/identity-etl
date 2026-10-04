@@ -186,18 +186,23 @@ second**, 100% hit rate against every ROR-identified organization this
 project's own graphs currently assert), and prints ready-to-paste YAML
 entries. Never writes to `identities.yaml` itself.
 
-**The suggested name always prefers Wikidata's own label over anything
-local**, for a real reason hit live: `orcid-etl` mints a proper
-`sdo:Organization` node (name, address, everything) for each ROR it
-uses, but `dataverse-etl` was found to sometimes point a dataset
-creator's `sdo:affiliation` straight at a bare ROR URI with **no local
-node describing the organization at all** -- so a naive "grab the
-`sdo:name` of whatever subject mentions this ROR" query silently returns
-the *dataset creator's own name* instead (confirmed live: entries like
-"Baten, Joerg" and "Bob Allen" where the ROR was actually a university).
-Entries where Wikidata has no match, or matches but the item carries no
-label in any language (also hit live, once, out of 49), are explicitly
-flagged in the output rather than silently trusting the local fallback.
+**The suggested name is the ROR URI's own `sdo:name`** -- both
+`orcid-etl` and `dataverse-etl` correctly mint a proper
+`sdo:Organization` node (name, address, everything) for every ROR they
+use, confirmed live across all 50 ROR-identified organizations this
+project's own graphs currently assert. Wikidata's label is only used as
+a fallback on the rare organization with no local name at all (not
+observed yet in this project's own data, but handled). Entries with
+neither a local name nor a usable Wikidata label are explicitly flagged
+in the output rather than silently guessing.
+
+(An earlier version of this tool got the name query wrong -- it grabbed
+`sdo:name` from whatever subject merely *pointed at* a ROR, e.g. a
+dataset's creator node, rather than the ROR URI's own name. That
+produced believable-looking but wrong names like "Baten, Joerg" for what
+was actually a university, and was briefly mistaken for a data error in
+`dataverse-etl` before the real cause -- a bug in this query -- was
+found.)
 
 ## What still needs to change for this to actually fix the viewer
 

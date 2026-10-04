@@ -1,50 +1,55 @@
 """Exercises format_entry's name-preference logic against hand-built data
--- no network access."""
+-- no network access.
+
+fallback_name here means "the ROR URI's own sdo:name from the graph" (see
+fetch_known_rors) -- reliable, since both orcid-etl and dataverse-etl mint
+a proper sdo:Organization node for every ROR they use (confirmed live,
+50/50). It equals ror_id itself only when fetch_known_rors found no local
+name at all, which is the one case Wikidata's label should be preferred."""
 from __future__ import annotations
 
 from identity_etl.discover_organizations import format_entry
 
 
-def test_prefers_wikidata_label_over_local_fallback():
+def test_prefers_local_name_over_wikidata_label():
+    # the local name is the graph's own authoritative sdo:name -- prefer
+    # it even when Wikidata also has a (same or different) label.
     text = format_entry(
-        entry_id=4,
-        fallback_name="Baten, Joerg",  # the wrong, locally-sourced name
-        ror_id="03a1kwz48",
-        wikidata_match={"wikidata": "https://www.wikidata.org/wiki/Q153978", "_label": "University of Tübingen"},
+        entry_id=1,
+        fallback_name="International Institute of Social History",
+        ror_id="05dq4pp56",
+        wikidata_match={"wikidata": "https://www.wikidata.org/wiki/Q1667757", "_label": "IISH"},
     )
-    assert 'name: "University of Tübingen"' in text
-    assert "Baten, Joerg" not in text
+    assert 'name: "International Institute of Social History"' in text
     assert "_label" not in text  # metadata, not a real identifier field
 
 
-def test_falls_back_to_local_name_and_flags_it_when_no_wikidata_match():
-    text = format_entry(entry_id=5, fallback_name="Some Local Name", ror_id="00000000x", wikidata_match=None)
-    assert 'name: "Some Local Name"' in text
-    assert "no Wikidata match found" in text
-    assert "may be" in text and "WRONG" in text
-
-
-def test_flags_fallback_name_even_when_wikidata_matched_but_has_no_label():
-    # real case hit live: Q2242095 matches via ROR but has zero labels in
-    # any language -- still a match, still needs the warning.
+def test_falls_back_to_wikidata_label_when_no_local_name():
+    # fetch_known_rors returns the bare ror_id itself when nothing in the
+    # graph asserts a name for it -- that's the signal "no local name".
     text = format_entry(
-        entry_id=8,
-        fallback_name="Depuydt, Katrien",
-        ror_id="04m5bjk54",
-        wikidata_match={"wikidata": "https://www.wikidata.org/wiki/Q2242095", "viaf": "https://viaf.org/viaf/126828545"},
+        entry_id=2,
+        fallback_name="00000000x",
+        ror_id="00000000x",
+        wikidata_match={"wikidata": "https://www.wikidata.org/wiki/Q1", "_label": "Some University"},
     )
-    assert 'name: "Depuydt, Katrien"' in text
-    assert "no label in any language" in text
-    assert "may be WRONG" in text
+    assert 'name: "Some University"' in text
+    assert "no sdo:name found" not in text  # Wikidata covered it, no warning needed
+
+
+def test_warns_when_neither_local_name_nor_wikidata_label_exists():
+    text = format_entry(entry_id=3, fallback_name="00000000x", ror_id="00000000x", wikidata_match=None)
+    assert 'name: "00000000x"' in text
+    assert "no sdo:name found" in text
 
 
 def test_includes_identifier_fields_but_not_ror_twice():
     text = format_entry(
         entry_id=1,
-        fallback_name="IISG",
+        fallback_name="International Institute of Social History",
         ror_id="05dq4pp56",
         wikidata_match={"wikidata": "https://www.wikidata.org/wiki/Q1667757", "viaf": "https://viaf.org/viaf/138745303",
-                         "_label": "International Institute of Social History"},
+                         "_label": "IISH"},
     )
     assert text.count('ror: "https://ror.org/05dq4pp56"') == 1
     assert 'viaf: "https://viaf.org/viaf/138745303"' in text
