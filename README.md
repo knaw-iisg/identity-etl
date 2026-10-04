@@ -148,6 +148,11 @@ from identity_etl import wikidata
 wikidata.lookup_by_orcid("0000-0003-3902-3720")
 # -> {"wikidata": "...", "viaf": "...", "isni": "...", "gnd": "..."}  (or None)
 
+wikidata.lookup_by_ror("05dq4pp56")
+# -> {"wikidata": "...", "viaf": "...", "isni": "...", "gnd": "..."}  (or None)
+# prefer this (or bulk_lookup_by_ror) over lookup_by_name whenever a ROR
+# is already known: unambiguous reverse lookup, not fuzzy label matching
+
 wikidata.lookup_by_name("International Institute of Social History")
 # -> list of candidate identifier dicts (there can be more than one
 #    same-named item; eyeball before using)
@@ -165,6 +170,34 @@ own development -- Wikidata is a live, constantly-edited wiki, not a
 static dataset). Use it as one more source to check per `identities.yaml`
 entry, not an automatic resolver -- it only ever returns candidates; nothing
 here writes to `identities.yaml`.
+
+## Growing the crosswalk: organizations already in the graph
+
+```
+python3 -m identity_etl.discover_organizations
+```
+
+Finds every ROR-identified organization already asserted somewhere in the
+merged knowledge graph (default endpoint: `http://localhost:7878`;
+override with `--endpoint`) that isn't yet in `identities.yaml`, looks
+each up via `bulk_lookup_by_ror` (one batched query, not one per
+organization -- measured live: **50 ROR ids resolved in well under a
+second**, 100% hit rate against every ROR-identified organization this
+project's own graphs currently assert), and prints ready-to-paste YAML
+entries. Never writes to `identities.yaml` itself.
+
+**The suggested name always prefers Wikidata's own label over anything
+local**, for a real reason hit live: `orcid-etl` mints a proper
+`sdo:Organization` node (name, address, everything) for each ROR it
+uses, but `dataverse-etl` was found to sometimes point a dataset
+creator's `sdo:affiliation` straight at a bare ROR URI with **no local
+node describing the organization at all** -- so a naive "grab the
+`sdo:name` of whatever subject mentions this ROR" query silently returns
+the *dataset creator's own name* instead (confirmed live: entries like
+"Baten, Joerg" and "Bob Allen" where the ROR was actually a university).
+Entries where Wikidata has no match, or matches but the item carries no
+label in any language (also hit live, once, out of 49), are explicitly
+flagged in the output rather than silently trusting the local fallback.
 
 ## What still needs to change for this to actually fix the viewer
 

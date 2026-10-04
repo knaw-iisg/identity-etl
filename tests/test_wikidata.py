@@ -45,6 +45,49 @@ def test_lookup_by_orcid_found(monkeypatch):
     assert len(calls) == 2
 
 
+def test_lookup_by_ror_returns_none_when_no_item(monkeypatch):
+    monkeypatch.setattr(wikidata, "_run", lambda query: [])
+    assert wikidata.lookup_by_ror("00000000x") is None
+
+
+def test_lookup_by_ror_found(monkeypatch):
+    def fake_run(query):
+        if "wikibase:directClaim" in query:  # the follow-up _item_identifiers query
+            return [{"prop": {"value": "P213"}, "value": {"value": "0000000403695151"}}]
+        return [_row("http://www.wikidata.org/entity/Q1667757")]  # the ROR lookup itself
+
+    monkeypatch.setattr(wikidata, "_run", fake_run)
+    result = wikidata.lookup_by_ror("05dq4pp56")
+    assert result["wikidata"] == "https://www.wikidata.org/wiki/Q1667757"
+    assert result["isni"] == "https://isni.org/isni/0000000403695151"
+
+
+def test_bulk_lookup_by_ror_empty_input_makes_no_query(monkeypatch):
+    monkeypatch.setattr(wikidata, "_run", lambda query: (_ for _ in ()).throw(AssertionError("should not query")))
+    assert wikidata.bulk_lookup_by_ror([]) == {}
+
+
+def test_bulk_lookup_by_ror_maps_each_match_including_label(monkeypatch):
+    def fake_run(query):
+        if "VALUES" in query:
+            return [
+                {"ror": {"value": "05dq4pp56"}, "item": {"value": "http://www.wikidata.org/entity/Q1667757"},
+                 "label": {"value": "International Institute of Social History"}},
+                {"ror": {"value": "0472cxd90"}, "item": {"value": "http://www.wikidata.org/entity/Q1377836"}},
+                # no "label" key at all -- OPTIONAL with no match, same as a real unlabeled item
+            ]
+        # per-item identifier fetch, keyed by whichever qid is in the query
+        if "Q1667757" in query:
+            return [{"prop": {"value": "P6782"}, "value": {"value": "05dq4pp56"}}]
+        return [{"prop": {"value": "P6782"}, "value": {"value": "0472cxd90"}}]
+
+    monkeypatch.setattr(wikidata, "_run", fake_run)
+    results = wikidata.bulk_lookup_by_ror(["05dq4pp56", "0472cxd90"])
+    assert set(results) == {"05dq4pp56", "0472cxd90"}
+    assert results["05dq4pp56"]["_label"] == "International Institute of Social History"
+    assert "_label" not in results["0472cxd90"]
+
+
 def test_lookup_by_name_dedupes_duplicate_rows(monkeypatch):
     def fake_run(query):
         if "rdfs:label" in query:

@@ -1,15 +1,17 @@
-"""Looks up a Wikidata item from a known seed identifier (an ORCID, or a
-name for organizations), and reads back whichever other identifiers
-Wikidata already knows for it -- a candidate source for new identities.yaml
-entries/fields, never written automatically. See README.md: "Growing the
-crosswalk".
+"""Looks up a Wikidata item from a known seed identifier (an ORCID or ROR,
+or a name as a last resort for organizations), and reads back whichever
+other identifiers Wikidata already knows for it -- a candidate source for
+new identities.yaml entries/fields, never written automatically. See
+README.md: "Growing the crosswalk".
 
 Coverage is lopsided by design, not a bug here: Wikidata is strong for
-institutions (confirmed live -- IISG's own item already has a ROR ID) and
-much weaker for individual researchers (confirmed live -- no item at all
-for this project's own primary maintainer's ORCID). Use it as one more
-source to check, not a replacement for the authority/staff-page matching
-this crosswalk otherwise relies on.
+institutions (confirmed live -- every one of the 50 distinct ROR-identified
+organizations already in this project's own merged graph matched, a 100%
+hit rate via bulk_lookup_by_ror) and much weaker for individual researchers
+(confirmed live -- no item at all for this project's own primary
+maintainer's ORCID, at least initially). Use it as one more source to
+check, not a replacement for the authority/staff-page matching this
+crosswalk otherwise relies on for people.
 """
 from __future__ import annotations
 
@@ -70,6 +72,59 @@ def lookup_by_orcid(orcid_id: str) -> dict[str, str] | None:
         return None
     qid = rows[0]["item"]["value"].rsplit("/", 1)[-1]
     return _item_identifiers(qid)
+
+
+def lookup_by_ror(ror_id: str) -> dict[str, str] | None:
+    """ror_id: bare id, e.g. "05dq4pp56". None if no Wikidata item claims
+    this ROR. Prefer this (or bulk_lookup_by_ror) over lookup_by_name for
+    organizations whenever a ROR is already known -- it's an unambiguous
+    reverse lookup, not fuzzy label matching, and measured 100% hit rate
+    against every ROR-identified organization already in this project's
+    own merged graph (see the repo's commit history for that check)."""
+    query = f'SELECT ?item WHERE {{ ?item wdt:P6782 "{ror_id}" . }} LIMIT 1'
+    rows = _run(query)
+    if not rows:
+        return None
+    qid = rows[0]["item"]["value"].rsplit("/", 1)[-1]
+    return _item_identifiers(qid)
+
+
+def bulk_lookup_by_ror(ror_ids: list[str]) -> dict[str, dict[str, str]]:
+    """ror_id -> identifiers dict, only for ids that matched -- plus the
+    item's own English label under "_label" (underscore-prefixed: it's
+    Wikidata's name for the entity, offered as a naming suggestion, not
+    an identifier to write into identities.yaml verbatim). Fetched in the
+    same batched query, not a separate per-item one: an organization
+    found this way (via a bare ROR URI used as e.g. a dataset creator's
+    sdo:affiliation, with no sdo:Organization node of its own anywhere in
+    the graph) has no reliable local name to fall back on -- see
+    discover_organizations.py.
+
+    One batched query to find which ids match at all (measured: 50 ids in
+    well under a second, vs. ~50 separate round trips), though each
+    match's own full identifier set still costs one more query
+    (_item_identifiers) -- not worth the extra complexity of a single
+    mega-query for the scale this is actually used at (dozens of
+    organizations, not thousands)."""
+    if not ror_ids:
+        return {}
+    values = " ".join(f'"{r}"' for r in ror_ids)
+    query = f"""
+    SELECT ?ror ?item ?label WHERE {{
+      VALUES ?ror {{ {values} }}
+      ?item wdt:P6782 ?ror .
+      OPTIONAL {{ ?item rdfs:label ?label . FILTER(LANG(?label) = "en") }}
+    }}
+    """
+    matches = {}
+    for row in _run(query):
+        ror_id = row["ror"]["value"]
+        qid = row["item"]["value"].rsplit("/", 1)[-1]
+        identifiers = _item_identifiers(qid)
+        if "label" in row:
+            identifiers["_label"] = row["label"]["value"]
+        matches[ror_id] = identifiers
+    return matches
 
 
 def lookup_by_name(name: str, instance_of_qid: str = "Q43229") -> list[dict[str, str]]:
