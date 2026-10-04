@@ -10,6 +10,7 @@ def test_format_entry_uses_authority_name_not_wikidata_label():
     entry = format_entry(
         entry_id=53,
         name="Testperson, Ada",
+        entity_type="Person",
         authority_uri="https://iisg.amsterdam/authority/person/999",
         wikidata_match={
             "wikidata": "https://www.wikidata.org/wiki/Q1",
@@ -23,3 +24,15 @@ def test_format_entry_uses_authority_name_not_wikidata_label():
     assert entry["authority"] == "https://iisg.amsterdam/authority/person/999"
     assert entry["viaf"] == "https://viaf.org/viaf/123"
     assert "_label" not in entry
+
+
+def test_format_entry_organization_type():
+    entry = format_entry(
+        entry_id=54,
+        name="Test Institute",
+        entity_type="Organization",
+        authority_uri="https://iisg.amsterdam/authority/organization/999",
+        wikidata_match={"wikidata": "https://www.wikidata.org/wiki/Q2", "viaf": "https://viaf.org/viaf/456"},
+    )
+    assert entry["type"] == "Organization"
+    assert entry["viaf"] == "https://viaf.org/viaf/456"

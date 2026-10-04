@@ -158,37 +158,61 @@ and `yaml.safe_load`-ing the whole file takes ~100s -- both fine for an
 occasional batch job, but worth knowing before reaching for this inside
 something latency-sensitive.
 
-## Growing the crosswalk: VIAF-linked authority persons
+## Growing the crosswalk: VIAF-linked authority records
 
 ```
-python3 -m identity_etl.add_viaf_persons
+python3 -m identity_etl.add_viaf_persons              # Person (default)
+python3 -m identity_etl.add_viaf_persons --type Organization
 ```
 
 Unlike `discover_organizations.py`, **this one writes directly** --
-finds every authority Person record that already carries a VIAF
-`sdo:sameAs` (`authorities-etl`'s own MARC-035-derived link) and isn't
-yet known, looks each VIAF id up on Wikidata in batches (properly
-batched: each request resolves *and* fetches full identifiers for up to
-200 ids at once, not one follow-up query per match -- necessary at this
-scale, see below), and for each match either appends a new entry or
-merges into an existing one via `IdentifierIndex`. The name used is
+finds every authority record of `--type` that already carries a VIAF
+`sdo:sameAs` (`authorities-etl`'s own MARC-035-derived link) and hasn't
+already been looked up, looks each VIAF id up on Wikidata in batches
+(properly batched: each request resolves *and* fetches full identifiers
+for up to 200 ids at once, not one follow-up query per match -- necessary
+at this scale, see below), and for each match either appends a new entry
+or merges into an existing one via `IdentifierIndex`. The name used is
 always the authority record's own `sdo:name`, never Wikidata's label --
-unlike ROR-identified organizations, authority Person records reliably
-have one, so there's nothing to fall back on.
+unlike ROR-identified organizations that sometimes have no local
+`sdo:Organization` node at all, authority records reliably have one, so
+there's nothing to fall back on.
 
-Measured live on this project's own graph: **18,172** VIAF-linked
-authority Person records, **11,116** matched on Wikidata (a lower hit
-rate than ROR's 100% -- expected, Wikidata's institutional coverage is
-far more complete than its coverage of individual researchers), yielding
-**11,113** new entries (a handful of authority records turned out to be
-catalogue duplicates of each other -- same VIAF cluster, correctly
-collapsed onto one hub instead of two). The whole run: ~8 minutes
-(batched Wikidata queries, politely paced), one HTTP request per ~200
-ids rather than per match -- a naive per-match approach would have meant
-over 11,000 sequential round trips, tens of minutes to hours instead.
+**Filters on the VIAF value, not the authority URI** -- a consequence of
+`mint_all_entities.py` existing: since every authority record already
+gets bare-minted (id + name + `authority:`, nothing else) in phase one,
+checking "is this authority URI already known" would be true for nearly
+everything and skip it before ever attempting the enrichment merge. The
+filter instead skips only VIAF ids this script has already resolved in a
+previous run.
 
-Safe to re-run: records already known (by `authority:` URI, or by any
-identifier already attached via a merge) are skipped.
+Measured live, Person (before `mint_all_entities.py` existed, so this run
+created new entries rather than merging): **18,172** VIAF-linked
+authority Person records, **11,116** matched on Wikidata, **11,113** new
+entries (a handful of authority records turned out to be catalogue
+duplicates of each other -- same VIAF cluster, correctly collapsed onto
+one hub instead of two). ~8 minutes, one HTTP request per ~200 ids rather
+than per match -- a naive per-match approach would have meant over 11,000
+sequential round trips, tens of minutes to hours instead.
+
+Measured live, Organization (**after** `mint_all_entities.py`, so every
+match merged into an already-bare-minted entry instead of creating a new
+one -- confirming the VIAF-value filter fix above): **175** VIAF-linked
+authority Organization records, **97** matched on Wikidata, **0** new
+entries / **97** merges. Also surfaced **22** ROR ids for organizations
+that had none before, arriving as a Wikidata bonus field alongside VIAF
+-- `discover_organizations.py`'s earlier ROR pass only ever saw ROR ids
+*already asserted in the merged graph*, which these weren't.
+
+**Known performance limit, not yet fixed**: `merge_fields_in_file`
+re-reads and rewrites the *entire* `identities.yaml` once per merge. Fine
+at hundreds of merges against a multi-megabyte file (the 97 Organization
+merges above took a few minutes); would be a real bottleneck at tens of
+thousands of merges against a much larger file. Worth batching into a
+single rewrite pass before running any VIAF/ORCID-type pass again after
+`identities.yaml` has grown substantially.
+
+Safe to re-run either `--type`: already-resolved VIAF ids are skipped.
 
 ## The identities.yaml format
 

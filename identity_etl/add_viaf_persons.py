@@ -7,21 +7,25 @@ and the name used is always the authority record's own sdo:name (never
 Wikidata's label), so there's nothing here that needs a human eyeballing
 each entry before it's trustworthy.
 
-Finds every authority Person record in the merged graph that already
-carries a VIAF sdo:sameAs (authorities-etl's own MARC-035-derived link),
-looks each VIAF id up on Wikidata in batches, and for every one that
-matched:
+Finds every authority record of the given --type (Person by default, or
+Organization) that already carries a VIAF sdo:sameAs (authorities-etl's
+own MARC-035-derived link), looks each VIAF id up on Wikidata in batches,
+and for every one that matched:
 
 - if none of the identifiers found (the VIAF itself, or anything else
   Wikidata returned alongside it -- ISNI, GND, ORCID, ...) belong to an
   existing entry already, appends a brand-new one;
-- if one of them *does* -- e.g. this VIAF's Wikidata item also carries an
-  ORCID that's already on an entry some other discovery pass created --
-  merges the new fields into that existing entry instead of creating a
-  second hub for the same real person. See pipeline.IdentifierIndex.
+- if one of them *does* -- most commonly now: mint_all_entities.py
+  already bare-minted this exact authority record with nothing but its
+  authority: field, and this is the first pass to find it a VIAF too --
+  merges the new fields into that existing entry rather than creating a
+  second hub. See pipeline.IdentifierIndex.
 
-Safe to re-run: authority records already known (by their authority: URI,
-or by any identifier already attached to some other entry) are skipped.
+Safe to re-run: skips only by the VIAF *value* already being known (we've
+already looked this one up), not by the authority URI being known --
+after mint_all_entities.py, every authority record's URI is already
+known from the moment it's bare-minted, so filtering on that would skip
+every candidate before ever attempting the enrichment merge.
 """
 from __future__ import annotations
 
@@ -36,23 +40,25 @@ from .wikidata import bulk_lookup_by_viaf
 
 DEFAULT_ENDPOINT = "http://localhost:7878"
 
+TYPE_SDO = {"Person": "https://schema.org/Person", "Organization": "https://schema.org/Organization"}
+
 # Selective by construction -- anchored on sdo:sameAs existing at all,
 # which narrows ~430K authority Person records down to ~18K before the
 # VIAF-prefix filter even runs. An earlier, differently-shaped query
 # elsewhere in this project (an unbound "?s ?p ?o" scan) timed out at 30s;
-# this one (measured live) returns all ~18,195 rows in well under a
-# second.
+# this one (measured live) returns all ~18,195 Person rows in well under
+# a second.
 AUTHORITY_VIAF_QUERY = """
-SELECT ?s ?name ?viaf WHERE {
-  GRAPH <https://iisg.amsterdam/graph/authority> {
-    ?s a <https://schema.org/Person> ; <https://schema.org/sameAs> ?viaf ; <https://schema.org/name> ?name .
+SELECT ?s ?name ?viaf WHERE {{
+  GRAPH <https://iisg.amsterdam/graph/authority> {{
+    ?s a <{sdo_type}> ; <https://schema.org/sameAs> ?viaf ; <https://schema.org/name> ?name .
     FILTER(STRSTARTS(STR(?viaf), "http://viaf.org/"))
-  }
-}
+  }}
+}}
 """
 
 
-def fetch_viaf_linked_authorities(endpoint: str) -> list[dict]:
+def fetch_viaf_linked_authorities(endpoint: str, entity_type: str) -> list[dict]:
     """[{"authority": uri, "name": str, "viaf_id": bare id}, ...]. A
     handful of authority records carry more than one VIAF sameAs (rare);
     each becomes its own row here, deduplicated by authority URI
@@ -60,7 +66,7 @@ def fetch_viaf_linked_authorities(endpoint: str) -> list[dict]:
     single viaf: field."""
     response = requests.get(
         endpoint,
-        params={"query": AUTHORITY_VIAF_QUERY},
+        params={"query": AUTHORITY_VIAF_QUERY.format(sdo_type=TYPE_SDO[entity_type])},
         headers={"Accept": "application/sparql-results+json"},
         timeout=30,
     )
@@ -75,8 +81,8 @@ def fetch_viaf_linked_authorities(endpoint: str) -> list[dict]:
     return rows
 
 
-def format_entry(entry_id: int, name: str, authority_uri: str, wikidata_match: dict[str, str]) -> dict:
-    entry = {"id": entry_id, "name": name, "type": "Person", "authority": authority_uri}
+def format_entry(entry_id: int, name: str, entity_type: str, authority_uri: str, wikidata_match: dict[str, str]) -> dict:
+    entry = {"id": entry_id, "name": name, "type": entity_type, "authority": authority_uri}
     for field, value in wikidata_match.items():
         if field != "_label":
             entry[field] = value
@@ -85,11 +91,12 @@ def format_entry(entry_id: int, name: str, authority_uri: str, wikidata_match: d
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Match VIAF-linked authority Person records against Wikidata and add them "
-                     "directly to identities.yaml (new entries, or merged into existing ones)"
+        description="Match VIAF-linked authority records against Wikidata and add them directly "
+                     "to identities.yaml (new entries, or merged into existing ones)"
     )
     parser.add_argument("--data-dir", help="same --data-dir as python -m identity_etl.cli")
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help=f"SPARQL endpoint (default: {DEFAULT_ENDPOINT})")
+    parser.add_argument("--type", choices=["Person", "Organization"], default="Person")
     parser.add_argument(
         "--dry-run", action="store_true",
         help="print what would be added/merged without writing to identities.yaml",
@@ -102,14 +109,19 @@ def main(argv: list[str] | None = None) -> int:
     entries = entries or []
     index = IdentifierIndex(entries)
 
-    print("Fetching VIAF-linked authority Person records...")
-    authority_rows = fetch_viaf_linked_authorities(args.endpoint)
+    print(f"Fetching VIAF-linked authority {args.type} records...")
+    authority_rows = fetch_viaf_linked_authorities(args.endpoint, args.type)
     by_authority = {row["authority"]: row for row in authority_rows}  # first VIAF wins on duplicates
-    new_rows = [row for uri, row in by_authority.items() if uri not in index]
+    # Filtered on the VIAF *value*, not the authority URI -- see module
+    # docstring for why that distinction matters now.
+    new_rows = [
+        row for row in by_authority.values()
+        if f"https://viaf.org/viaf/{row['viaf_id']}" not in index
+    ]
 
     print(
-        f"{len(by_authority)} VIAF-linked authority Person record(s) in the graph, "
-        f"{len(new_rows)} not already known"
+        f"{len(by_authority)} VIAF-linked authority {args.type} record(s) in the graph, "
+        f"{len(new_rows)} with a VIAF not already looked up"
     )
     if not new_rows:
         return 0
@@ -136,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
                 merges.append((existing["id"], added))
             continue
 
-        entry = format_entry(next_id, row["name"], row["authority"], match)
+        entry = format_entry(next_id, row["name"], args.type, row["authority"], match)
         index.add(entry)
         new_entries.append(entry)
         next_id += 1
