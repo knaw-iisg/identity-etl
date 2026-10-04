@@ -4,11 +4,54 @@ IDs are verified manually (see the module docstring and commit history),
 not re-verified here on every test run."""
 from __future__ import annotations
 
+import requests
+
 from identity_etl import wikidata
 
 
 def _row(value, var="item"):
     return {var: {"value": value}}
+
+
+class _FakeResponse:
+    def __init__(self, bindings):
+        self._bindings = bindings
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"results": {"bindings": self._bindings}}
+
+
+def test_run_retries_on_timeout_then_succeeds(monkeypatch):
+    monkeypatch.setattr(wikidata.time, "sleep", lambda _: None)
+    calls = {"n": 0}
+
+    def fake_get(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise requests.exceptions.ReadTimeout("simulated")
+        return _FakeResponse([_row("http://www.wikidata.org/entity/Q1")])
+
+    monkeypatch.setattr(wikidata.requests, "get", fake_get)
+    result = wikidata._run("SELECT ?item WHERE {}")
+    assert calls["n"] == 3
+    assert result[0]["item"]["value"] == "http://www.wikidata.org/entity/Q1"
+
+
+def test_run_raises_after_exhausting_retries(monkeypatch):
+    monkeypatch.setattr(wikidata.time, "sleep", lambda _: None)
+
+    def fake_get(*args, **kwargs):
+        raise requests.exceptions.ReadTimeout("simulated")
+
+    monkeypatch.setattr(wikidata.requests, "get", fake_get)
+    try:
+        wikidata._run("SELECT ?item WHERE {}")
+        assert False, "expected ReadTimeout to propagate"
+    except requests.exceptions.ReadTimeout:
+        pass
 
 
 def test_item_identifiers_maps_known_properties(monkeypatch):
@@ -34,9 +77,9 @@ def test_lookup_by_orcid_found(monkeypatch):
 
     def fake_run(query):
         calls.append(query)
-        if "wdt:P496" in query:
-            return [_row("http://www.wikidata.org/entity/Q58282714")]
-        return [{"prop": {"value": "P227"}, "value": {"value": "142916110"}}]
+        if "wikibase:directClaim" in query:  # the follow-up _item_identifiers query
+            return [{"prop": {"value": "P227"}, "value": {"value": "142916110"}}]
+        return [_row("http://www.wikidata.org/entity/Q58282714")]  # the ORCID lookup itself
 
     monkeypatch.setattr(wikidata, "_run", fake_run)
     result = wikidata.lookup_by_orcid("0000-0003-3902-3720")

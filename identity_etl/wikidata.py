@@ -15,10 +15,14 @@ crosswalk otherwise relies on for people.
 """
 from __future__ import annotations
 
+import time
+
 import requests
 
 SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
 USER_AGENT = "identity-etl/0.1 (https://github.com/knaw-iisg/identity-etl)"
+MAX_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 2
 
 # Wikidata property -> (our field name, URI template). Verified against
 # Wikidata's own property labels -- see the repo's commit history for the
@@ -29,18 +33,32 @@ PROPERTY_MAP = {
     "P244": ("lcauth", "https://id.loc.gov/authorities/names/{}"),
     "P227": ("gnd", "https://d-nb.info/gnd/{}"),
     "P6782": ("ror", "https://ror.org/{}"),
+    "P496": ("orcid", "https://orcid.org/{}"),
 }
 
 
 def _run(query: str) -> list[dict]:
-    response = requests.get(
-        SPARQL_ENDPOINT,
-        params={"query": query},
-        headers={"Accept": "application/sparql-results+json", "User-Agent": USER_AGENT},
-        timeout=30,
-    )
-    response.raise_for_status()
-    return response.json()["results"]["bindings"]
+    """A single wedged request (timeout, connection reset, Wikidata
+    momentarily 5xx-ing) shouldn't kill a run that's otherwise making many
+    of these -- e.g. add_viaf_persons.py's ~91 sequential batches against
+    a free public service. Retries with backoff; gives up and raises
+    after MAX_ATTEMPTS."""
+    last_error = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = requests.get(
+                SPARQL_ENDPOINT,
+                params={"query": query},
+                headers={"Accept": "application/sparql-results+json", "User-Agent": USER_AGENT},
+                timeout=30,
+            )
+            response.raise_for_status()
+            return response.json()["results"]["bindings"]
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+    raise last_error
 
 
 def _item_identifiers(qid: str) -> dict[str, str]:
@@ -125,6 +143,49 @@ def bulk_lookup_by_ror(ror_ids: list[str]) -> dict[str, dict[str, str]]:
             identifiers["_label"] = row["label"]["value"]
         matches[ror_id] = identifiers
     return matches
+
+
+def bulk_lookup_by_viaf(viaf_ids: list[str], batch_size: int = 200) -> dict[str, dict[str, str]]:
+    """viaf_id (bare, e.g. "159839532") -> identifiers dict (plus
+    "_label"), only for ids that matched.
+
+    Unlike bulk_lookup_by_ror, this fetches each match's full identifier
+    set in the *same* query as the matching itself, not a follow-up query
+    per match -- necessary at this function's actual scale (thousands of
+    authority records, not dozens of organizations): one-query-per-match
+    would mean thousands of sequential round trips, tens of minutes to
+    hours. Batched in groups of batch_size (default 200 -- the size
+    measured live to resolve in well under a second per batch)."""
+    results: dict[str, dict[str, str]] = {}
+    props = ", ".join(f"wdt:{p}" for p in PROPERTY_MAP)
+    for i in range(0, len(viaf_ids), batch_size):
+        batch = viaf_ids[i:i + batch_size]
+        values = " ".join(f'"{v}"' for v in batch)
+        query = f"""
+        SELECT ?viaf ?item ?label ?prop ?value WHERE {{
+          VALUES ?viaf {{ {values} }}
+          ?item wdt:P214 ?viaf .
+          OPTIONAL {{ ?item rdfs:label ?label . FILTER(LANG(?label) = "en") }}
+          OPTIONAL {{
+            ?item ?p ?value .
+            ?propEntity wikibase:directClaim ?p .
+            BIND(STRAFTER(STR(?propEntity), "http://www.wikidata.org/entity/") AS ?prop)
+            FILTER(?p IN ({props}))
+          }}
+        }}
+        """
+        for row in _run(query):
+            viaf_id = row["viaf"]["value"]
+            qid = row["item"]["value"].rsplit("/", 1)[-1]
+            entry = results.setdefault(viaf_id, {"wikidata": f"https://www.wikidata.org/wiki/{qid}"})
+            if "label" in row:
+                entry["_label"] = row["label"]["value"]
+            if "prop" in row:
+                field, template = PROPERTY_MAP[row["prop"]["value"]]
+                entry[field] = template.format(row["value"]["value"])
+        if i + batch_size < len(viaf_ids):
+            time.sleep(0.5)  # polite pacing over ~90 consecutive batches against a free public service
+    return results
 
 
 def lookup_by_name(name: str, instance_of_qid: str = "Q43229") -> list[dict[str, str]]:

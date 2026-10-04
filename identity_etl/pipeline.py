@@ -80,6 +80,65 @@ def add_entry(g: Graph, entry: dict) -> URIRef:
     return hub
 
 
+class IdentifierIndex:
+    """Maps every identifier value already in use to the entry that owns
+    it. This is what makes cross-pass co-occurrence detection possible: a
+    discovery script seeded on one identifier type (say, ROR) often finds
+    others for free (VIAF, ISNI, ...) via the same Wikidata item. If one
+    of those already belongs to an entry some *other* pass created (say,
+    a VIAF-seeded authority-matching pass), that's not a new entity --
+    it's the same one reached a second way, and should be merged into the
+    existing entry, not given a second hub.
+
+    Built once from identities.yaml, then kept current as a run proceeds
+    (merge/add update it immediately) so a later candidate in the same
+    run can still find an entry that was only just enriched or created.
+    """
+
+    def __init__(self, entries: list[dict]):
+        self._by_value: dict[str, dict] = {}
+        for entry in entries:
+            self.add(entry)
+
+    def __contains__(self, value: str) -> bool:
+        return value in self._by_value
+
+    def find(self, candidate_identifiers: dict[str, str]) -> dict | None:
+        """candidate_identifiers: field -> value, e.g. a Wikidata lookup's
+        result dict (ror/viaf/isni/gnd/lcauth/orcid/wikidata, plus
+        "_label") -- or any other dict shaped like a partial entry.
+        Returns the existing entry that already owns any one of these
+        values, or None if this looks like a genuinely new entity."""
+        for key, value in candidate_identifiers.items():
+            if key in RESERVED_KEYS or key == "_label" or not value:
+                continue
+            if value in self._by_value:
+                return self._by_value[value]
+        return None
+
+    def merge(self, entry: dict, candidate_identifiers: dict[str, str]) -> dict[str, str]:
+        """Adds whichever fields from candidate_identifiers aren't
+        already present on entry (never overwrites an existing value --
+        the first-written identifier for a field wins). Returns just the
+        fields that were actually added (empty if nothing was new), so a
+        caller can e.g. patch only those into an on-disk file rather than
+        rewriting the whole entry."""
+        added = {}
+        for key, value in candidate_identifiers.items():
+            if key in RESERVED_KEYS or key == "_label" or not value:
+                continue
+            if key not in entry:
+                entry[key] = value
+                self._by_value[value] = entry
+                added[key] = value
+        return added
+
+    def add(self, entry: dict) -> None:
+        """Registers a (typically brand-new) entry's identifiers."""
+        for value in identifiers(entry):
+            self._by_value[value] = entry
+
+
 def build_graph(entries: list[dict]) -> Graph:
     validate_entries(entries)
     g = Graph(identifier=DEFAULT_GRAPH)

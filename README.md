@@ -80,6 +80,60 @@ directly, e.g. via search.
   lexemes vs. schema constraints) that this namespace has no equivalent
   of: it only ever mints one kind of thing.
 
+## Cross-pass deduplication: `IdentifierIndex`
+
+Different discovery scripts seed from different identifier types (ROR,
+VIAF, ORCID, ...), but often pull back *other* identifiers for free --
+e.g. a ROR lookup via Wikidata routinely also returns that organization's
+VIAF id. If that VIAF id already belongs to an entry some *other* pass
+created, that's not a new entity -- it's the same one, reached a second
+way, and must be merged into the existing entry rather than given a
+second hub.
+
+`pipeline.IdentifierIndex` is what makes this possible: a value -> entry
+map built from every identifier already in `identities.yaml`, kept
+current as a run proceeds. Before creating a new entry, a script should
+call `index.find(candidate_identifiers)` -- if it returns an existing
+entry, `index.merge(existing, candidate_identifiers)` adds only the
+genuinely new fields (never overwrites) and returns what was added; only
+when `find` returns `None` should a brand-new entry be created (then
+registered with `index.add(entry)` so later candidates in the same run
+can find it too). `add_viaf_persons.py` is the reference implementation;
+any future discovery script that writes directly to `identities.yaml`
+should use the same pattern.
+
+## Growing the crosswalk: VIAF-linked authority persons
+
+```
+python3 -m identity_etl.add_viaf_persons
+```
+
+Unlike `discover_organizations.py`, **this one writes directly** --
+finds every authority Person record that already carries a VIAF
+`sdo:sameAs` (`authorities-etl`'s own MARC-035-derived link) and isn't
+yet known, looks each VIAF id up on Wikidata in batches (properly
+batched: each request resolves *and* fetches full identifiers for up to
+200 ids at once, not one follow-up query per match -- necessary at this
+scale, see below), and for each match either appends a new entry or
+merges into an existing one via `IdentifierIndex`. The name used is
+always the authority record's own `sdo:name`, never Wikidata's label --
+unlike ROR-identified organizations, authority Person records reliably
+have one, so there's nothing to fall back on.
+
+Measured live on this project's own graph: **18,172** VIAF-linked
+authority Person records, **11,116** matched on Wikidata (a lower hit
+rate than ROR's 100% -- expected, Wikidata's institutional coverage is
+far more complete than its coverage of individual researchers), yielding
+**11,113** new entries (a handful of authority records turned out to be
+catalogue duplicates of each other -- same VIAF cluster, correctly
+collapsed onto one hub instead of two). The whole run: ~8 minutes
+(batched Wikidata queries, politely paced), one HTTP request per ~200
+ids rather than per match -- a naive per-match approach would have meant
+over 11,000 sequential round trips, tens of minutes to hours instead.
+
+Safe to re-run: records already known (by `authority:` URI, or by any
+identifier already attached via a merge) are skipped.
+
 ## The identities.yaml format
 
 Personally-identifying curation data, not code -- same boundary as

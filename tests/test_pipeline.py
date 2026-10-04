@@ -6,6 +6,7 @@ import pytest
 from rdflib import RDF, Literal, URIRef
 
 from identity_etl.pipeline import (
+    IdentifierIndex,
     build_graph,
     hub_uri,
     identifiers,
@@ -87,3 +88,34 @@ def test_next_free_id_is_max_plus_one_not_first_gap():
 
 def test_next_free_id_on_empty_list():
     assert next_free_id([]) == 1
+
+
+def test_identifier_index_finds_entry_by_any_shared_value():
+    existing = person(1, "Ada Testperson", authority=A, viaf=B)
+    index = IdentifierIndex([existing])
+    # a new candidate that shares the viaf value but not the authority --
+    # still the same entity, found via the shared field.
+    found = index.find({"viaf": B, "ror": "https://ror.org/new"})
+    assert found is existing
+
+
+def test_identifier_index_no_match_for_unrelated_candidate():
+    index = IdentifierIndex([person(1, "Ada Testperson", authority=A)])
+    assert index.find({"viaf": B}) is None
+
+
+def test_identifier_index_merge_adds_only_new_fields_never_overwrites():
+    existing = person(1, "Ada Testperson", authority=A)
+    index = IdentifierIndex([existing])
+    added = index.merge(existing, {"authority": "https://different", "viaf": B, "wikidata": C})
+    assert added == {"viaf": B, "wikidata": C}  # authority already present -> not touched/overwritten
+    assert existing["authority"] == A  # unchanged
+    assert existing["viaf"] == B
+    assert B in index  # newly merged value is now findable too
+
+
+def test_identifier_index_add_registers_new_entry_for_later_lookups():
+    index = IdentifierIndex([])
+    new_entry = person(1, "Ada Testperson", orcid=B)
+    index.add(new_entry)
+    assert index.find({"orcid": B}) is new_entry
