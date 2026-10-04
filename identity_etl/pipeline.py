@@ -124,15 +124,33 @@ class IdentifierIndex:
         the first-written identifier for a field wins). Returns just the
         fields that were actually added (empty if nothing was new), so a
         caller can e.g. patch only those into an on-disk file rather than
-        rewriting the whole entry."""
+        rewriting the whole entry.
+
+        Also refuses to add a value that already belongs to a *different*
+        entry -- without this check, two already-separately-minted
+        entries that turn out to share one external identifier (e.g. two
+        authority records both carrying the same VIAF cluster, each
+        bare-minted by mint_all_entities.py before the overlap was known)
+        could each independently be "found" via their own distinct field
+        and have the shared value written onto both, corrupting the
+        one-value-one-entry invariant this whole index exists to protect
+        (hit live: 96 duplicate values from exactly this scenario, before
+        this check existed). That situation means the two entries are
+        probably the same real entity -- out of scope to actually merge
+        here (see README's bare-name entity resolution gap) -- so the
+        conflicting field is just skipped, not added to either further."""
         added = {}
         for key, value in candidate_identifiers.items():
             if key in RESERVED_KEYS or key == "_label" or not value:
                 continue
-            if key not in entry:
-                entry[key] = value
-                self._by_value[value] = entry
-                added[key] = value
+            if key in entry:
+                continue
+            owner = self._by_value.get(value)
+            if owner is not None and owner is not entry:
+                continue
+            entry[key] = value
+            self._by_value[value] = entry
+            added[key] = value
         return added
 
     def add(self, entry: dict) -> None:
@@ -199,18 +217,42 @@ def append_entries(identities_file, new_entries: list[dict]) -> None:
 
 
 def merge_fields_in_file(identities_file, entry_id: int, added_fields: dict[str, str]) -> None:
-    """Patches newly-merged fields into an *existing* entry's block
+    """Patches newly-merged fields into one *existing* entry's block
     in-place (located by its "- id: {entry_id}" line), rather than
     rewriting the whole file -- same reasoning as append_entries: keep
-    the diff to exactly what changed, not a full reformat."""
-    if not added_fields:
+    the diff to exactly what changed, not a full reformat.
+
+    O(file_size) per call (a linear scan to find the block) -- fine for
+    a handful of merges, but calling this once per merge in a loop costs
+    O(merges x file_size) overall. At thousands of merges against a
+    multi-megabyte file that's the dominant cost by far (confirmed live:
+    an attempted 7,184-merge run was still running after several minutes
+    and was killed) -- use apply_merges for more than a few merges at
+    once."""
+    apply_merges(identities_file, {entry_id: added_fields})
+
+
+def apply_merges(identities_file, merges: dict[int, dict[str, str]]) -> None:
+    """Same effect as calling merge_fields_in_file once per (entry_id,
+    added_fields) pair in merges, but a single read-scan-write pass
+    (O(file_size), not O(merges x file_size)) -- the only way this stays
+    practical once merges number in the thousands. Entries not mentioned
+    in merges are passed through untouched."""
+    merges = {entry_id: fields for entry_id, fields in merges.items() if fields}
+    if not merges:
         return
     path = Path(identities_file)
     lines = path.read_text().split("\n")
-    start = next(i for i, line in enumerate(lines) if line.strip() == f"- id: {entry_id}")
-    end = start + 1
-    while end < len(lines) and lines[end].strip():
-        end += 1
-    insert = [f"  {key}: {yaml_quote(value)}" for key, value in added_fields.items() if key in FIELD_ORDER]
-    lines[end:end] = insert
-    path.write_text("\n".join(lines))
+    output = []
+    pending: dict[str, str] | None = None  # fields queued for insertion at the end of the current block
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("- id: "):
+            pending = merges.get(int(stripped[len("- id: "):]))
+        if pending is not None and stripped == "":
+            output.extend(f"  {key}: {yaml_quote(value)}" for key, value in pending.items() if key in FIELD_ORDER)
+            pending = None
+        output.append(line)
+    if pending is not None:  # file didn't end with a trailing blank line after the last entry
+        output.extend(f"  {key}: {yaml_quote(value)}" for key, value in pending.items() if key in FIELD_ORDER)
+    path.write_text("\n".join(output))

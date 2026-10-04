@@ -9,23 +9,30 @@ each entry before it's trustworthy.
 
 Finds every authority record of the given --type (Person by default, or
 Organization) that already carries a VIAF sdo:sameAs (authorities-etl's
-own MARC-035-derived link), looks each VIAF id up on Wikidata in batches,
-and for every one that matched:
+own MARC-035-derived link) and whose VIAF isn't recorded yet, and for
+each one:
 
-- if none of the identifiers found (the VIAF itself, or anything else
-  Wikidata returned alongside it -- ISNI, GND, ORCID, ...) belong to an
-  existing entry already, appends a brand-new one;
-- if one of them *does* -- most commonly now: mint_all_entities.py
-  already bare-minted this exact authority record with nothing but its
-  authority: field, and this is the first pass to find it a VIAF too --
-  merges the new fields into that existing entry rather than creating a
-  second hub. See pipeline.IdentifierIndex.
+1. **Always** records the VIAF itself -- this is a fact already known
+   from our own source data (authorities-etl's MARC 035 field), true
+   regardless of whatever Wikidata does or doesn't know. Recording it
+   must not be contingent on Wikidata also matching.
+2. **Separately, best-effort**, looks the VIAF id up on Wikidata (batched)
+   and layers in whatever else it finds (ISNI, GND, ORCID, a Wikidata id
+   itself, ...) when it does match.
 
-Safe to re-run: skips only by the VIAF *value* already being known (we've
-already looked this one up), not by the authority URI being known --
-after mint_all_entities.py, every authority record's URI is already
-known from the moment it's bare-minted, so filtering on that would skip
-every candidate before ever attempting the enrichment merge.
+These two used to be conflated -- a record only got anything written if
+Wikidata *also* matched, silently dropping the VIAF link itself on the
+~39% of records Wikidata didn't recognize (confirmed live: 7,138 records
+with a known local VIAF, never recorded, purely because step 2 failed).
+Every candidate now either merges into an already-bare-minted entry (the
+common case, from mint_all_entities.py) or creates a new one -- never
+skipped outright.
+
+Safe to re-run: skips only by the VIAF *value* already being recorded,
+not by the authority URI being known -- after mint_all_entities.py,
+every authority record's URI is already known from the moment it's
+bare-minted, so filtering on that would skip every candidate before ever
+reaching step 1.
 """
 from __future__ import annotations
 
@@ -35,7 +42,7 @@ import requests
 import yaml
 
 from .cli import resolve_data_dir
-from .pipeline import IdentifierIndex, append_entries, merge_fields_in_file, next_free_id, validate_entries
+from .pipeline import IdentifierIndex, apply_merges, append_entries, next_free_id, validate_entries
 from .wikidata import bulk_lookup_by_viaf
 
 DEFAULT_ENDPOINT = "http://localhost:7878"
@@ -81,10 +88,13 @@ def fetch_viaf_linked_authorities(endpoint: str, entity_type: str) -> list[dict]
     return rows
 
 
-def format_entry(entry_id: int, name: str, entity_type: str, authority_uri: str, wikidata_match: dict[str, str]) -> dict:
-    entry = {"id": entry_id, "name": name, "type": entity_type, "authority": authority_uri}
-    for field, value in wikidata_match.items():
-        if field != "_label":
+def format_entry(
+    entry_id: int, name: str, entity_type: str, authority_uri: str, viaf_uri: str,
+    wikidata_match: dict[str, str] | None,
+) -> dict:
+    entry = {"id": entry_id, "name": name, "type": entity_type, "authority": authority_uri, "viaf": viaf_uri}
+    for field, value in (wikidata_match or {}).items():
+        if field not in ("_label", "viaf"):  # viaf already set above, from local knowledge either way
             entry[field] = value
     return entry
 
@@ -129,31 +139,37 @@ def main(argv: list[str] | None = None) -> int:
 
     viaf_ids = [row["viaf_id"] for row in new_rows]
     matches = bulk_lookup_by_viaf(viaf_ids)
-    print(f"{len(matches)}/{len(new_rows)} matched on Wikidata.")
+    print(f"{len(matches)}/{len(new_rows)} additionally matched on Wikidata (the rest still get their VIAF recorded).")
 
     next_id = next_free_id(entries)
     new_entries = []
-    merges: list[tuple[int, dict]] = []  # (existing entry's id, fields that were added to it)
+    merges: dict[int, dict] = {}  # existing entry's id -> fields added to it (across possibly several rows)
     for row in new_rows:
-        match = matches.get(row["viaf_id"])
-        if not match:
-            continue
-        candidate = dict(match)
-        candidate["authority"] = row["authority"]
+        viaf_uri = f"https://viaf.org/viaf/{row['viaf_id']}"
+        match = matches.get(row["viaf_id"])  # None is fine -- the VIAF itself is recorded either way
+
+        candidate = {"authority": row["authority"], "viaf": viaf_uri}
+        for field, value in (match or {}).items():
+            if field != "_label":
+                candidate[field] = value
 
         existing = index.find(candidate)
         if existing:
             added = index.merge(existing, candidate)
             if added:
-                merges.append((existing["id"], added))
+                merges.setdefault(existing["id"], {}).update(added)
             continue
 
-        entry = format_entry(next_id, row["name"], args.type, row["authority"], match)
+        entry = format_entry(next_id, row["name"], args.type, row["authority"], viaf_uri, match)
         index.add(entry)
         new_entries.append(entry)
         next_id += 1
 
-    print(f"{len(new_entries)} new entries, {len(merges)} merged into existing entries (co-occurring identifiers).")
+    print(
+        f"{len(new_entries)} new entries, {len(merges)} merged into existing entries "
+        f"(VIAF recorded for all {len(new_entries) + len(merges)}; {len(matches)} of those also got "
+        f"Wikidata-sourced bonus fields)."
+    )
 
     if args.dry_run:
         print("--dry-run: not writing anything.")
@@ -161,8 +177,7 @@ def main(argv: list[str] | None = None) -> int:
 
     validate_entries(entries + new_entries)  # fail before writing anything, not partway through
     append_entries(identities_file, new_entries)
-    for entry_id, added_fields in merges:
-        merge_fields_in_file(identities_file, entry_id, added_fields)
+    apply_merges(identities_file, merges)  # one read-scan-write pass for all merges, not one per merge
     print(f"Appended {len(new_entries)} entries and applied {len(merges)} merges to {identities_file}.")
 
     return 0

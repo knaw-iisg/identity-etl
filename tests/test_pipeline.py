@@ -10,6 +10,7 @@ import yaml
 from identity_etl.pipeline import (
     IdentifierIndex,
     append_entries,
+    apply_merges,
     build_graph,
     hub_uri,
     identifiers,
@@ -119,6 +120,22 @@ def test_identifier_index_merge_adds_only_new_fields_never_overwrites():
     assert B in index  # newly merged value is now findable too
 
 
+def test_identifier_index_merge_refuses_a_value_already_owned_elsewhere():
+    # two entries that turn out to share one VIAF -- e.g. two authority
+    # records, each already separately bare-minted, that are actually
+    # the same real entity. The shared value must not end up on both.
+    entry1 = person(1, "Ada Testperson", authority=A)
+    entry2 = person(2, "A Duplicate Record", authority="https://different-authority")
+    index = IdentifierIndex([entry1, entry2])
+
+    index.merge(entry1, {"authority": A, "viaf": B})  # B now belongs to entry1
+    added = index.merge(entry2, {"authority": "https://different-authority", "viaf": B})
+
+    assert added == {}  # viaf refused -- already entry1's
+    assert "viaf" not in entry2
+    assert entry1["viaf"] == B  # entry1's own claim is untouched
+
+
 def test_identifier_index_add_registers_new_entry_for_later_lookups():
     index = IdentifierIndex([])
     new_entry = person(1, "Ada Testperson", orcid=B)
@@ -210,4 +227,48 @@ def test_merge_fields_in_file_noop_when_nothing_added(tmp_path):
     original = '- id: 1\n  name: "First"\n  type: "Person"\n  authority: "https://a1"\n\n'
     identities_file.write_text(original)
     merge_fields_in_file(identities_file, entry_id=1, added_fields={})
+    assert identities_file.read_text() == original
+
+
+def test_apply_merges_patches_multiple_entries_in_one_pass(tmp_path):
+    identities_file = tmp_path / "identities.yaml"
+    identities_file.write_text(
+        '- id: 1\n  name: "First"\n  type: "Person"\n  authority: "https://a1"\n\n'
+        '- id: 2\n  name: "Second"\n  type: "Person"\n  authority: "https://a2"\n\n'
+        '- id: 3\n  name: "Third"\n  type: "Person"\n  authority: "https://a3"\n\n'
+    )
+    apply_merges(identities_file, {
+        1: {"viaf": "https://viaf.org/viaf/111"},
+        3: {"viaf": "https://viaf.org/viaf/333", "wikidata": "https://www.wikidata.org/wiki/Q3"},
+    })
+    parsed = yaml.safe_load(identities_file.read_text())
+    assert len(parsed) == 3
+    assert parsed[0]["viaf"] == "https://viaf.org/viaf/111"
+    assert "viaf" not in parsed[1]  # entry 2 wasn't in the merge set -- untouched
+    assert parsed[2]["viaf"] == "https://viaf.org/viaf/333"
+    assert parsed[2]["wikidata"] == "https://www.wikidata.org/wiki/Q3"
+
+
+def test_apply_merges_gives_same_result_as_merge_fields_in_file_looped(tmp_path):
+    base = (
+        '- id: 1\n  name: "First"\n  type: "Person"\n  authority: "https://a1"\n\n'
+        '- id: 2\n  name: "Second"\n  type: "Person"\n  authority: "https://a2"\n\n'
+    )
+    via_loop = tmp_path / "via_loop.yaml"
+    via_loop.write_text(base)
+    merge_fields_in_file(via_loop, 1, {"viaf": "https://viaf.org/viaf/111"})
+    merge_fields_in_file(via_loop, 2, {"viaf": "https://viaf.org/viaf/222"})
+
+    via_batch = tmp_path / "via_batch.yaml"
+    via_batch.write_text(base)
+    apply_merges(via_batch, {1: {"viaf": "https://viaf.org/viaf/111"}, 2: {"viaf": "https://viaf.org/viaf/222"}})
+
+    assert yaml.safe_load(via_loop.read_text()) == yaml.safe_load(via_batch.read_text())
+
+
+def test_apply_merges_noop_on_empty_dict(tmp_path):
+    identities_file = tmp_path / "identities.yaml"
+    original = '- id: 1\n  name: "First"\n  type: "Person"\n  authority: "https://a1"\n\n'
+    identities_file.write_text(original)
+    apply_merges(identities_file, {})
     assert identities_file.read_text() == original
