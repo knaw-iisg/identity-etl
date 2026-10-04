@@ -14,6 +14,8 @@ identifiers really do refer to the same entity.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from rdflib import RDF, Graph, Literal, URIRef
 
 from .prefixes import DEFAULT_GRAPH, ID, NAMESPACE_BINDINGS, SDO
@@ -147,3 +149,68 @@ def build_graph(entries: list[dict]) -> Graph:
     for entry in entries:
         add_entry(g, entry)
     return g
+
+
+# Field order used when writing identities.yaml by hand (not through
+# yaml.dump -- see yaml_quote/append_entries below for why).
+FIELD_ORDER = ("authority", "viaf", "wikidata", "isni", "gnd", "lcauth", "orcid", "ror")
+
+
+def yaml_quote(value: str) -> str:
+    """Minimal, correct escaping for a YAML double-quoted scalar.
+    Real catalog data (hundreds of thousands of names, at the scale this
+    is used for) will contain quotes, backslashes, and the occasional
+    stray control character -- naive f'"{value}"' formatting breaks (or
+    silently corrupts) on any of those. YAML double-quoted scalars use
+    the same core escapes as JSON strings; these five cover what's
+    actually been observed in this project's source data."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = escaped.replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
+    return f'"{escaped}"'
+
+
+def format_entry_yaml(entry: dict) -> str:
+    """One entry, in identities.yaml's hand-written style: plain
+    unquoted int id, double-quoted (properly escaped) strings, fields in
+    FIELD_ORDER."""
+    lines = [
+        f"- id: {entry['id']}",
+        f"  name: {yaml_quote(entry['name'])}",
+        f"  type: {yaml_quote(entry['type'])}",
+    ]
+    for key in FIELD_ORDER:
+        if key in entry:
+            lines.append(f"  {key}: {yaml_quote(entry[key])}")
+    return "\n".join(lines)
+
+
+def append_entries(identities_file, new_entries: list[dict]) -> None:
+    """Appends in identities.yaml's existing hand-written style (each
+    entry's lines, then one blank line -- matching the blank line that
+    already trails the file's last existing entry) rather than
+    re-serializing the whole file through yaml.dump, which would
+    reformat every existing entry too and bury a real change in an
+    unreviewable diff."""
+    if not new_entries:
+        return
+    text = "".join(format_entry_yaml(e) + "\n\n" for e in new_entries)
+    with open(identities_file, "a") as f:
+        f.write(text)
+
+
+def merge_fields_in_file(identities_file, entry_id: int, added_fields: dict[str, str]) -> None:
+    """Patches newly-merged fields into an *existing* entry's block
+    in-place (located by its "- id: {entry_id}" line), rather than
+    rewriting the whole file -- same reasoning as append_entries: keep
+    the diff to exactly what changed, not a full reformat."""
+    if not added_fields:
+        return
+    path = Path(identities_file)
+    lines = path.read_text().split("\n")
+    start = next(i for i, line in enumerate(lines) if line.strip() == f"- id: {entry_id}")
+    end = start + 1
+    while end < len(lines) and lines[end].strip():
+        end += 1
+    insert = [f"  {key}: {yaml_quote(value)}" for key, value in added_fields.items() if key in FIELD_ORDER]
+    lines[end:end] = insert
+    path.write_text("\n".join(lines))

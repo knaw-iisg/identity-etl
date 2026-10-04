@@ -30,15 +30,34 @@ person's library-catalogued works and their ORCID-sourced works
 (papers, presentations, employment, funding) sit on two disconnected
 nodes. Landing on either one only shows that one's own data.
 
-This repo doesn't try to resolve that automatically. It's a small,
-explicit, human-verified list: an entity's name, and whichever of its
-identifiers a human has actually checked and confirmed refer to the same
-real person or organization. **It is deliberately never complete** -- the
-same honest caveat
-[orcid-etl's colleagues.yaml](https://github.com/knaw-iisg/orcid-etl)
-carries. Growing it is a manual curation task; `identity_etl.wikidata`
-(below) helps find candidates, but nothing writes to `identities.yaml`
-on its own.
+## The two-phase model: mint, then enrich
+
+Every entity across *every* IISG resource -- archive, biblio, dataverse,
+findingaid, authorities, orcid, events -- gets an IISG id, unconditionally,
+whether or not it already has an external identifier or is just a bare
+name with a locally-minted, pipeline-internal URI. That's phase one:
+`mint_all_entities.py`, no network calls, no matching, just "does this
+entity have a hub yet? If not, give it one." **Most entities end up with
+only their IISG id and nothing else -- that's the normal, expected
+outcome, not a gap to fill.** Measured live: 555,609 distinct entities
+across the whole merged graph; 16,283 of them have no recognized external
+identifier scheme at all.
+
+Phase two is external-identifier *enrichment*, run separately, per
+identifier system: `discover_organizations.py` (ROR, via Wikidata),
+`add_viaf_persons.py` (authority-linked VIAF, via Wikidata), and whatever
+comes after (ORCID, direct Wikidata matching, ...). Each one takes
+entities that *already* have an id and checks whether they also match
+something external -- this is strictly additive to phase one, never a
+replacement for it.
+
+**What phase one deliberately does not do**: resolve the same real entity
+appearing as *different bare-name nodes* across pipelines with no shared
+identifier at all -- e.g. the library authority's "Zijdeman, Richard" and
+a Dataverse dataset's "Richard Zijdeman" currently get two separate IISG
+ids, not one. That's a real, open problem (name-variant entity
+resolution, not identifier-crosswalk matching), deliberately deferred
+rather than solved badly -- see "What's still unsolved" near the bottom.
 
 ## Setup
 
@@ -101,6 +120,43 @@ registered with `index.add(entry)` so later candidates in the same run
 can find it too). `add_viaf_persons.py` is the reference implementation;
 any future discovery script that writes directly to `identities.yaml`
 should use the same pattern.
+
+## Minting: every entity, identified or not
+
+```
+python3 -m identity_etl.mint_all_entities
+```
+
+Phase one (see "The two-phase model" above). Finds every distinct
+`sdo:Person`/`sdo:Organization` node across *every* named graph (one
+query, selective by construction -- `?s a ?type` with `?type` restricted
+to exactly those two values, not an unbound scan; measured live: 555,609
+rows in ~2.6s) and, for every one not already covered by an existing
+entry (via `IdentifierIndex`, so a ROR- or VIAF-matched entity from an
+earlier enrichment pass gets no redundant second hub), mints a new one.
+
+The entity's own URI is classified by scheme (`URI_SCHEME_FIELDS`):
+`authority/person/`+`authority/organization/` -> `authority:`,
+`orcid.org/` -> `orcid:`, `ror.org/` -> `ror:`, `viaf.org/` -> `viaf:`,
+`isni.org/` -> `isni:`, `d-nb.info/gnd/` -> `gnd:`, `id.loc.gov/` ->
+`lcauth:`. Anything else -- a `dataverse-etl` `#creator-<hash>`/
+`#org-<hash>` fragment, an `orcid-etl` `urn:orcidgraph:org:` fallback for
+an organization with no ROR -- gets an id and a name, nothing else; that
+URI isn't a real external identifier, just the pipeline's own internal
+plumbing for an entity it couldn't otherwise identify.
+
+No network calls (pure local SPARQL + file write), so safe to re-run
+often as upstream pipelines add new entities -- already-known ones are
+skipped, matching this repo's usual idempotency.
+
+Measured live (one run, on top of the 11,165 entries phase-two tools had
+already created): 555,609 distinct entities total, 544,433 newly minted
+-- 528,150 with a recognized scheme, 16,283 with only their IISG id.
+`identities.yaml` grew from ~500KB to ~71MB; the full RDF build
+(`identity_etl.cli`) takes ~3.5 minutes at this scale (2,293,870 triples)
+and `yaml.safe_load`-ing the whole file takes ~100s -- both fine for an
+occasional batch job, but worth knowing before reaching for this inside
+something latency-sensitive.
 
 ## Growing the crosswalk: VIAF-linked authority persons
 
@@ -272,6 +328,25 @@ This repo only produces the links. Two more pieces, not yet done:
    person's "Creations" list -- and incoming-statement counts generally
    -- merge across all their known identities, not just whichever one
    the viewer currently has dereferenced.
+
+## What's still unsolved: bare-name entity resolution
+
+`mint_all_entities.py` gives every entity an id, but deliberately does
+**not** try to figure out that two *differently-spelled, identifier-less*
+mentions are the same real person or organization -- e.g. the library
+authority's "Zijdeman, Richard" and a Dataverse dataset's "Richard
+Zijdeman" currently mint two separate IISG ids, with nothing connecting
+them. `IdentifierIndex` only catches overlap when two entities share an
+*actual identifier value* (a ROR, a VIAF, ...); two bare names, however
+obviously the same person to a human, share nothing it can compare.
+
+Closing that gap needs genuine name-variant matching (title-case vs.
+"Last, First" ordering, middle names, transliteration, ...) with a real
+risk of false positives at this entity count -- explicitly out of scope
+for now, deferred rather than solved badly. Worth knowing before relying
+on `identities.yaml` to mean "one entry per real entity" -- today it
+means "one entry per *distinct identified node*," which for bare-name
+entities can still be more than one per real entity.
 
 ## Tests
 

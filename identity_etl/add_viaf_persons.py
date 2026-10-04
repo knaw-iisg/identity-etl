@@ -26,13 +26,12 @@ or by any identifier already attached to some other entry) are skipped.
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 import requests
 import yaml
 
 from .cli import resolve_data_dir
-from .pipeline import IdentifierIndex, next_free_id, validate_entries
+from .pipeline import IdentifierIndex, append_entries, merge_fields_in_file, next_free_id, validate_entries
 from .wikidata import bulk_lookup_by_viaf
 
 DEFAULT_ENDPOINT = "http://localhost:7878"
@@ -82,45 +81,6 @@ def format_entry(entry_id: int, name: str, authority_uri: str, wikidata_match: d
         if field != "_label":
             entry[field] = value
     return entry
-
-
-FIELD_ORDER = ("authority", "viaf", "wikidata", "isni", "gnd", "lcauth", "orcid", "ror")
-
-
-def append_entries(identities_file, new_entries: list[dict]) -> None:
-    """Appends in identities.yaml's existing hand-written style (quoted
-    scalars, one blank line between entries) rather than re-serializing
-    the whole file through yaml.dump, which would reformat every existing
-    entry too and bury this change in an unreviewable diff."""
-    lines = []
-    for entry in new_entries:
-        lines.append(f"- id: {entry['id']}")
-        lines.append(f'  name: "{entry["name"]}"')
-        lines.append(f'  type: "{entry["type"]}"')
-        for key in FIELD_ORDER:
-            if key in entry:
-                lines.append(f'  {key}: "{entry[key]}"')
-        lines.append("")
-    with open(identities_file, "a") as f:
-        f.write("\n".join(lines) + "\n")
-
-
-def merge_fields_in_file(identities_file, entry_id: int, added_fields: dict[str, str]) -> None:
-    """Patches newly-merged fields into an *existing* entry's block
-    in-place (located by its "- id: {entry_id}" line), rather than
-    rewriting the whole file -- same reasoning as append_entries: keep
-    the diff to exactly what changed, not a full reformat."""
-    if not added_fields:
-        return
-    path = Path(identities_file)
-    lines = path.read_text().split("\n")
-    start = next(i for i, line in enumerate(lines) if line.strip() == f"- id: {entry_id}")
-    end = start + 1
-    while end < len(lines) and lines[end].strip():
-        end += 1
-    insert = [f'  {key}: "{value}"' for key, value in added_fields.items() if key in FIELD_ORDER]
-    lines[end:end] = insert
-    path.write_text("\n".join(lines))
 
 
 def main(argv: list[str] | None = None) -> int:

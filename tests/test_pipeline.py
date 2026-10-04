@@ -5,13 +5,18 @@ from __future__ import annotations
 import pytest
 from rdflib import RDF, Literal, URIRef
 
+import yaml
+
 from identity_etl.pipeline import (
     IdentifierIndex,
+    append_entries,
     build_graph,
     hub_uri,
     identifiers,
+    merge_fields_in_file,
     next_free_id,
     validate_entries,
+    yaml_quote,
 )
 from identity_etl.prefixes import SDO
 
@@ -119,3 +124,90 @@ def test_identifier_index_add_registers_new_entry_for_later_lookups():
     new_entry = person(1, "Ada Testperson", orcid=B)
     index.add(new_entry)
     assert index.find({"orcid": B}) is new_entry
+
+
+def test_yaml_quote_escapes_quotes_backslashes_and_control_chars():
+    cases = [
+        'Smith, John "Jack"',
+        "O'Brien\\Test",
+        "Line1\nLine2",
+        "Tab\tHere",
+        "Normal Name",
+        "Müller, Hans",
+    ]
+    for value in cases:
+        line = f"name: {yaml_quote(value)}"
+        assert yaml.safe_load(line)["name"] == value
+
+
+def test_append_entries_preserves_existing_file_and_is_valid_yaml(tmp_path):
+    identities_file = tmp_path / "identities.yaml"
+    identities_file.write_text(
+        '# a header comment\n\n- id: 1\n  name: "Existing Org"\n  type: "Organization"\n  ror: "https://ror.org/x"\n\n'
+    )
+    append_entries(identities_file, [
+        {"id": 2, "name": "Testperson, Ada", "type": "Person",
+         "authority": "https://iisg.amsterdam/authority/person/999",
+         "viaf": "https://viaf.org/viaf/123", "wikidata": "https://www.wikidata.org/wiki/Q1"},
+    ])
+
+    text = identities_file.read_text()
+    assert "# a header comment" in text  # existing content untouched
+    assert 'name: "Existing Org"' in text
+
+    parsed = yaml.safe_load(text)
+    assert len(parsed) == 2
+    assert parsed[1]["id"] == 2
+    assert parsed[1]["authority"] == "https://iisg.amsterdam/authority/person/999"
+
+
+def test_append_entries_handles_names_with_quotes_safely(tmp_path):
+    identities_file = tmp_path / "identities.yaml"
+    identities_file.write_text("")
+    append_entries(identities_file, [
+        {"id": 1, "name": 'Smith, John "Jack"', "type": "Person", "authority": "https://a"},
+    ])
+    parsed = yaml.safe_load(identities_file.read_text())
+    assert parsed[0]["name"] == 'Smith, John "Jack"'
+
+
+def test_append_entries_field_order_is_stable(tmp_path):
+    identities_file = tmp_path / "identities.yaml"
+    identities_file.write_text("")
+    append_entries(identities_file, [
+        {"id": 1, "name": "Ada", "type": "Person", "authority": "https://a", "orcid": "https://o",
+         "wikidata": "https://w", "viaf": "https://v"},
+    ])
+    lines = identities_file.read_text().splitlines()
+    keys = [line.strip().split(":")[0] for line in lines if line.strip() and not line.startswith("#")]
+    assert keys == ["- id", "name", "type", "authority", "viaf", "wikidata", "orcid"]
+
+
+def test_append_entries_noop_on_empty_list(tmp_path):
+    identities_file = tmp_path / "identities.yaml"
+    identities_file.write_text("original content\n")
+    append_entries(identities_file, [])
+    assert identities_file.read_text() == "original content\n"
+
+
+def test_merge_fields_in_file_inserts_into_the_right_block_only(tmp_path):
+    identities_file = tmp_path / "identities.yaml"
+    identities_file.write_text(
+        '- id: 1\n  name: "First"\n  type: "Person"\n  authority: "https://a1"\n\n'
+        '- id: 2\n  name: "Second"\n  type: "Person"\n  authority: "https://a2"\n\n'
+    )
+    merge_fields_in_file(identities_file, entry_id=2, added_fields={"viaf": "https://viaf.org/viaf/999"})
+
+    parsed = yaml.safe_load(identities_file.read_text())
+    assert len(parsed) == 2  # no new entry created
+    assert "viaf" not in parsed[0]  # entry 1 untouched
+    assert parsed[1]["viaf"] == "https://viaf.org/viaf/999"
+    assert parsed[1]["authority"] == "https://a2"  # existing fields preserved
+
+
+def test_merge_fields_in_file_noop_when_nothing_added(tmp_path):
+    identities_file = tmp_path / "identities.yaml"
+    original = '- id: 1\n  name: "First"\n  type: "Person"\n  authority: "https://a1"\n\n'
+    identities_file.write_text(original)
+    merge_fields_in_file(identities_file, entry_id=1, added_fields={})
+    assert identities_file.read_text() == original
